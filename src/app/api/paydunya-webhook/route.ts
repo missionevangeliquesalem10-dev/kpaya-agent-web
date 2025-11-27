@@ -1,113 +1,129 @@
 import { NextRequest, NextResponse } from 'next/server';
 import * as admin from 'firebase-admin';
 
-// --- CONFIGURATION FIREBASE ADMIN ---
-// Récupération de la clé du compte de service à partir de la variable d'environnement Vercel
-const serviceAccountKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+// --- CONFIG FIREBASE ADMIN SUR VERCEL ---
+const projectId = process.env.FIREBASE_PROJECT_ID;
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
-// Initialisation de Firebase Admin
 if (!admin.apps.length) {
-  try {
-    // ⚠️ On parse la chaîne JSON stockée dans la variable d'environnement
-    const serviceAccount = JSON.parse(serviceAccountKey || '{}');
-    
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    console.log("Firebase Admin Webhook Initialized successfully from ENV.");
-
-  } catch (error) {
-    console.warn("Firebase Admin Initialization Webhook Failed:", error);
+  if (!projectId || !clientEmail || !privateKey) {
+    console.error("❌ Firebase Admin Webhook non initialisé : variables manquantes.");
+  } else {
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId,
+          clientEmail,
+          privateKey,
+        }),
+      });
+      console.log("✅ Firebase Admin Webhook initialisé.");
+    } catch (error) {
+      console.error("❌ Erreur Firebase Admin Webhook :", error);
+    }
   }
 }
 
 const db = admin.firestore();
 
-// Clé à utiliser pour la vérification de l'intégrité de la requête PayDunya
+// PAYDUNYA
 const PAYDUNYA_MASTER_KEY = process.env.PAYDUNYA_MASTER_KEY;
-const __app_id = process.env.NEXT_PUBLIC_APP_ID || 'kpaya-recycling-app'; // ID d'application par défaut
+const PAYDUNYA_PRIVATE_KEY = process.env.PAYDUNYA_PRIVATE_KEY;
+const PAYDUNYA_TOKEN = process.env.PAYDUNYA_TOKEN;
+const PAYDUNYA_API_BASE_URL = process.env.PAYDUNYA_API_BASE_URL;
 
-// --- ROUTE DU WEBHOOK PAYDUNYA ---
+const APP_ID = process.env.NEXT_PUBLIC_APP_ID || "kpaya-recycling-app";
+
+// --- ROUTE WEBHOOK ---
 export async function POST(req: NextRequest) {
-    // Vérification de l'initialisation avant de procéder
-    if (!admin.apps.length || !serviceAccountKey) {
-        // Retourner un succès (200) même en cas d'erreur d'initialisation pour éviter
-        // que PayDunya ne réessaie la requête en boucle, mais on log l'échec.
-        console.error("WEBHOOK FAILED: Firebase Admin non initialisé.");
-        return NextResponse.json({ success: true, message: 'Erreur d\'initialisation traitée.' }, { status: 200 });
+  // Toujours retourner 200 pour éviter les retries PayDunya
+  if (!admin.apps.length) {
+    console.error("❌ Webhook : Firebase Admin non initialisé.");
+    return NextResponse.json(
+      { success: true, message: "Firebase non initialisé, ignoré." },
+      { status: 200 }
+    );
+  }
+
+  try {
+    const body = await req.json();
+    const invoiceToken = body.invoice_token;
+
+    if (!invoiceToken) {
+      return NextResponse.json(
+        { success: true, message: "Token manquant, ignoré." },
+        { status: 200 }
+      );
     }
 
-    try {
-        // Le corps de la requête est le POST envoyé par PayDunya
-        const body = await req.json();
-        
-        const invoiceToken = body.invoice_token;
-        if (!invoiceToken) {
-            return NextResponse.json({ success: false, message: 'Token de facture manquant.' }, { status: 400 });
-        }
+    // Vérification PayDunya
+    const verifyResponse = await fetch(`${PAYDUNYA_API_BASE_URL}/checkout/invoices/verify/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "PAYDUNYA-MASTER-KEY": PAYDUNYA_MASTER_KEY || "",
+        "PAYDUNYA-PRIVATE-KEY": PAYDUNYA_PRIVATE_KEY || "",
+        "PAYDUNYA-TOKEN": PAYDUNYA_TOKEN || "",
+      },
+      body: JSON.stringify({ token: invoiceToken }),
+    });
 
-        // 1. Vérification de l'intégrité de la transaction via l'API PayDunya (Critique !)
-        const verifyResponse = await fetch(`${process.env.PAYDUNYA_API_BASE_URL}/checkout/invoices/verify/`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'PAYDUNYA-MASTER-KEY': PAYDUNYA_MASTER_KEY || '',
-                'PAYDUNYA-PRIVATE-KEY': process.env.PAYDUNYA_PRIVATE_KEY || '',
-                'PAYDUNYA-TOKEN': process.env.PAYDUNYA_TOKEN || '',
-            },
-            body: JSON.stringify({ token: invoiceToken }),
-        });
+    const verificationData = await verifyResponse.json();
 
-        const verificationData = await verifyResponse.json();
-
-        // Si la transaction n'est pas "completed" ou le code n'est pas '00', on ignore.
-        if (verificationData.response_code !== '00' || verificationData.status !== 'completed') {
-            console.warn("Paiement non complété ou échoué. Statut PayDunya:", verificationData.status);
-            return NextResponse.json({ success: true, message: 'Paiement non complété ou échoué.' }, { status: 200 }); 
-        }
-
-        // Extraction des données
-        const companyId = verificationData.custom_data.companyId; 
-        const amountPaid = verificationData.invoice.total_amount;
-        
-        // --- LOGIQUE MÉTIER : CRÉDIT ---
-        const pointsToCredit = amountPaid; // Simplification: 1 XOF = 1 Point.
-
-        // 2. Exécution de la Transaction Atomique (Crédit)
-        const companyRef = db.collection('recycling_companies').doc(companyId);
-
-        await db.runTransaction(async (transaction) => {
-            const companyDoc = await transaction.get(companyRef);
-
-            if (!companyDoc.exists) {
-                // Si l'entreprise n'existe pas, on log une erreur critique et on ne crédite pas
-                throw new Error(`Entreprise ${companyId} introuvable. Échec du crédit.`);
-            }
-
-            // Crédit de l'entreprise (augmentation du solde de points)
-            transaction.update(companyRef, {
-                currentPoints: admin.firestore.FieldValue.increment(pointsToCredit),
-            });
-
-            // Ajout d'une transaction de type 'RECHARGE' dans l'historique
-            // Nous utilisons une collection 'transactions' de base ici pour l'exemple.
-            db.collection('transactions').doc().set({
-                type: 'RECHARGE',
-                companyId: companyId,
-                amountXOF: amountPaid,
-                pointsCredited: pointsToCredit,
-                timestamp: admin.firestore.FieldValue.serverTimestamp(),
-                status: 'COMPLETED',
-                source: 'PayDunya'
-            });
-        });
-
-        // 3. Succès: Réponse 200 (CRITIQUE pour le Webhook)
-        return NextResponse.json({ success: true, message: 'Solde de l\'entreprise crédité avec succès.' }, { status: 200 });
-
-    } catch (error: any) {
-        console.error("Erreur Webhook lors du traitement:", error.message);
-        // Toujours retourner 200 pour éviter les tentatives de renvoi par PayDunya
-        return NextResponse.json({ success: true, message: 'Erreur interne traitée.' }, { status: 200 }); 
+    if (
+      verificationData.response_code !== "00" ||
+      verificationData.status !== "completed"
+    ) {
+      console.warn("⚠ Paiement non terminé :", verificationData.status);
+      return NextResponse.json(
+        { success: true, message: "Paiement non terminé." },
+        { status: 200 }
+      );
     }
+
+    // Extraction des données
+    const companyId = verificationData.custom_data.companyId;
+    const amountPaid = verificationData.invoice.total_amount;
+
+    const pointsToCredit = amountPaid; // 1 XOF = 1 point
+
+    // Transaction Firestore
+    const companyRef = db.collection("recycling_companies").doc(companyId);
+
+    await db.runTransaction(async (tx) => {
+      const companyDoc = await tx.get(companyRef);
+
+      if (!companyDoc.exists) {
+        throw new Error(`Entreprise ${companyId} introuvable.`);
+      }
+
+      tx.update(companyRef, {
+        currentPoints: admin.firestore.FieldValue.increment(pointsToCredit),
+      });
+
+      // Ajout historique
+      db.collection("transactions").doc().set({
+        type: "RECHARGE",
+        companyId,
+        amountXOF: amountPaid,
+        pointsCredited: pointsToCredit,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        status: "COMPLETED",
+        source: "PayDunya",
+      });
+    });
+
+    return NextResponse.json(
+      { success: true, message: "Crédit effectué." },
+      { status: 200 }
+    );
+
+  } catch (error: any) {
+    console.error("❌ Erreur Webhook :", error);
+    return NextResponse.json(
+      { success: true, message: "Erreur interne ignorée." },
+      { status: 200 }
+    );
+  }
 }
