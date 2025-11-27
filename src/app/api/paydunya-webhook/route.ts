@@ -37,7 +37,6 @@ const APP_ID = process.env.NEXT_PUBLIC_APP_ID || "kpaya-recycling-app";
 
 // --- ROUTE WEBHOOK ---
 export async function POST(req: NextRequest) {
-  // Toujours retourner 200 pour éviter les retries PayDunya
   if (!admin.apps.length) {
     console.error("❌ Webhook : Firebase Admin non initialisé.");
     return NextResponse.json(
