@@ -1,76 +1,109 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from "next/server";
 
-// Clés d'API PayDunya (Doivent être dans les variables d'environnement!)
-const PAYDUNYA_MASTER_KEY = process.env.PAYDUNYA_MASTER_KEY;
-const PAYDUNYA_PRIVATE_KEY = process.env.PAYDUNYA_PRIVATE_KEY;
-const PAYDUNYA_TOKEN = process.env.PAYDUNYA_TOKEN;
-const PAYDUNYA_BASE_URL = process.env.PAYDUNYA_API_BASE_URL;
+// Exécution côté Node.js pour fetch sécurisé et accès aux variables
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-// URL vers laquelle PayDunya enverra la confirmation de paiement (à créer plus tard)
-const IPN_URL = 'https://kpaya-agent-web.vercel.app/api/paydunya-webhook'; 
+// Variables d'environnement PayDunya
+const {
+  PAYDUNYA_MASTER_KEY,
+  PAYDUNYA_PRIVATE_KEY,
+  PAYDUNYA_PUBLIC_KEY,
+  PAYDUNYA_TOKEN,
+  PAYDUNYA_API_BASE_URL,
+  APP_DOMAIN,
+} = process.env;
 
+// Domaine de ton application
+const DOMAIN = APP_DOMAIN || "https://kpaya-agent-web.vercel.app";
+const IPN_URL = `${DOMAIN}/api/paydunya-webhook`;
+
+/* -------------------- UTILITAIRE DE VÉRIFICATION DES CLÉS -------------------- */
+function checkEnvVars() {
+  const missing = [];
+  if (!PAYDUNYA_MASTER_KEY) missing.push("PAYDUNYA_MASTER_KEY");
+  if (!PAYDUNYA_PRIVATE_KEY) missing.push("PAYDUNYA_PRIVATE_KEY");
+  if (!PAYDUNYA_PUBLIC_KEY) missing.push("PAYDUNYA_PUBLIC_KEY");
+  if (!PAYDUNYA_TOKEN) missing.push("PAYDUNYA_TOKEN");
+  if (!PAYDUNYA_API_BASE_URL) missing.push("PAYDUNYA_API_BASE_URL");
+  if (!DOMAIN) missing.push("APP_DOMAIN");
+  return missing;
+}
+
+/* -------------------- ENDPOINT PAYDUNYA INIT -------------------- */
 export async function POST(req: NextRequest) {
-    
-    // Cette API serait appelée par l'application mobile de l'utilisateur (ou par le web si l'entreprise recharge son compte)
-    try {
-        const { amount, description, userEmail, userId } = await req.json();
-
-        if (!amount || amount <= 0 || !userEmail || !userId) {
-            return NextResponse.json({ error: 'Montant, email ou ID utilisateur manquant.' }, { status: 400 });
-        }
-
-        // 1. Préparation de la requête PayDunya
-        const invoiceData = {
-            // L'identifiant unique de votre transaction (important pour le Webhook)
-            invoice: {
-                // Montant en devise locale (XOF, USD, etc. - PayDunya gère la conversion)
-                total_amount: amount, 
-                description: description || `Recharge de points Kpaya pour l'utilisateur ${userId}`,
-                // Les clés sont passées dans les headers par sécurité
-                custom_data: { userId: userId } // Données que vous voulez récupérer au Webhook
-            },
-            store: {
-                name: "Kpaya Recyclage Store",
-            },
-            actions: {
-                // L'URL où l'utilisateur est redirigé après le paiement
-                return_url: `https://votredomaine.vercel.app/success?user=${userId}`,
-                // L'URL où PayDunya enverra la confirmation POST (IPN)
-                cancel_url: `https://votredomaine.vercel.app/cancel?user=${userId}`,
-                callback_url: IPN_URL,
-            },
-        };
-
-        // 2. Appel à l'API PayDunya
-        const response = await fetch(`${PAYDUNYA_BASE_URL}/checkout/invoices/create`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'PAYDUNYA-MASTER-KEY': PAYDUNYA_MASTER_KEY || '',
-                'PAYDUNYA-PRIVATE-KEY': PAYDUNYA_PRIVATE_KEY || '',
-                'PAYDUNYA-TOKEN': PAYDUNYA_TOKEN || '',
-            },
-            body: JSON.stringify(invoiceData),
-        });
-
-        const paydunyaResponse = await response.json();
-
-        if (paydunyaResponse.response_code !== '00') {
-             console.error("Erreur PayDunya:", paydunyaResponse);
-             throw new Error(paydunyaResponse.response_text || "Échec de la création de la facture PayDunya.");
-        }
-
-        // 3. Succès : Retourne l'URL de redirection à l'application cliente
-        return NextResponse.json({ 
-            success: true, 
-            invoiceToken: paydunyaResponse.token,
-            paymentUrl: paydunyaResponse.response_data.checkout_url 
-        }, { status: 200 });
-
-    } catch (error: any) {
-        console.error("Erreur d'initialisation de paiement:", error.message);
-        return NextResponse.json({ 
-            error: error.message || "Impossible d'initialiser le paiement.",
-        }, { status: 500 });
+  try {
+    // Vérifie les variables d'environnement
+    const missingVars = checkEnvVars();
+    if (missingVars.length > 0) {
+      console.error("❌ Variables manquantes :", missingVars);
+      return NextResponse.json(
+        { success: false, error: `Variables d'environnement manquantes: ${missingVars.join(", ")}` },
+        { status: 500 }
+      );
     }
+
+    // Récupère les données du client
+    const { amount, description, userEmail, userId } = await req.json();
+
+    // Validation simple
+    if (!amount || amount <= 0)
+      return NextResponse.json({ success: false, error: "Montant invalide." }, { status: 400 });
+    if (!userEmail || !userId)
+      return NextResponse.json({ success: false, error: "Email ou ID utilisateur manquant." }, { status: 400 });
+
+    // Prépare les données pour PayDunya
+    const invoiceData = {
+      invoice: {
+        total_amount: amount,
+        description: description || `Recharge de points Kpaya pour l'utilisateur ${userId}`,
+        custom_data: { userId, email: userEmail },
+      },
+      store: { name: "Kpaya Recyclage Store" },
+      actions: {
+        return_url: `${DOMAIN}/success?user=${userId}`,
+        cancel_url: `${DOMAIN}/cancel?user=${userId}`,
+        callback_url: IPN_URL,
+      },
+    };
+
+    // Appel à PayDunya
+    const response = await fetch(`${PAYDUNYA_API_BASE_URL}/checkout/invoices/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "PAYDUNYA-MASTER-KEY": PAYDUNYA_MASTER_KEY,
+        "PAYDUNYA-PRIVATE-KEY": PAYDUNYA_PRIVATE_KEY,
+        "PAYDUNYA-TOKEN": PAYDUNYA_TOKEN,
+      },
+      body: JSON.stringify(invoiceData),
+    });
+
+    const data = await response.json();
+
+    // Vérification du succès
+    if (data.response_code !== "00") {
+      console.error("🚨 Erreur PayDunya:", data);
+      return NextResponse.json(
+        { success: false, error: data.response_text || "Échec création facture PayDunya." },
+        { status: 500 }
+      );
+    }
+
+    // Succès
+    return NextResponse.json(
+      {
+        success: true,
+        invoiceToken: data.token,
+        paymentUrl: data.response_data.checkout_url,
+      },
+      { status: 200 }
+    );
+  } catch (error: any) {
+    console.error("❌ Erreur PayDunya init:", error.message || error);
+    return NextResponse.json(
+      { success: false, error: error.message || "Impossible d'initialiser le paiement." },
+      { status: 500 }
+    );
+  }
 }
