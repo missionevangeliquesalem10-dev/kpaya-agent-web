@@ -1,10 +1,8 @@
-// firebase.ts
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
-import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
-
-// Vos clés récupérées depuis .env.local
+// Configuration Firebase
 const firebaseConfig = {
     apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
     authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
@@ -14,9 +12,17 @@ const firebaseConfig = {
     appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-// Vérifie si une application Firebase est déjà initialisée (utile pour le Hot Reload de Next.js)
-const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
+// Fonction pour initialiser l'application Firebase (si elle n'existe pas déjà)
+let app;
+if (!getApps().length) {
+    app = initializeApp(firebaseConfig);
+} else {
+    app = getApp();
+}
 
-// Exporter les services que nous utiliserons
+// Exportation des services pour être utilisés dans l'application
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+
+// Exportez l'application elle-même si nécessaire
+export default app;
