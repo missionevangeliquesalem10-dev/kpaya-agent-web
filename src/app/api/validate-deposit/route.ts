@@ -1,103 +1,123 @@
-import { NextRequest, NextResponse } from 'next/server';
-import * as admin from 'firebase-admin';
+import { NextRequest, NextResponse } from "next/server";
+import * as admin from "firebase-admin";
 
-// 1. Initialisation de Firebase Admin
-// Cette vérification empêche de ré-initialiser l'app plusieurs fois (hot reload)
+// Empêche l'exécution en Edge Runtime (Firebase ne fonctionne pas en Edge)
+export const runtime = "nodejs";
+// Empêche Next.js de générer la route statiquement
+export const dynamic = "force-dynamic";
+
+/* ------------------------------ CONFIG FIREBASE ADMIN ------------------------------ */
+const projectId = process.env.FIREBASE_PROJECT_ID;
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+// Initialisation sécurisée Firebase Admin
 if (!admin.apps.length) {
-  try {
-    // On utilise require pour charger le JSON localement
-    // Assurez-vous que le fichier est bien à la racine du projet
-    const serviceAccount = require('../../../../service-account.json');
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-  } catch (error) {
-    console.error("Erreur d'initialisation Firebase Admin:", error);
+  if (!projectId || !clientEmail || !privateKey) {
+    console.error("❌ Firebase Admin non initialisé (variables manquantes).");
+  } else {
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId,
+          clientEmail,
+          privateKey,
+        }),
+      });
+      console.log("✅ Firebase Admin initialisé.");
+    } catch (error) {
+      console.error("❌ Erreur d'initialisation Firebase Admin :", error);
+    }
   }
 }
 
 const db = admin.firestore();
 
+/* -------------------------------------- ROUTE -------------------------------------- */
 export async function POST(req: NextRequest) {
+  if (!admin.apps.length) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "Firebase Admin n'est pas initialisé. Vérifiez vos variables d'environnement Vercel.",
+      },
+      { status: 500 }
+    );
+  }
+
   try {
     const body = await req.json();
     const { userId, agentUid, companyId, weightKg, points } = body;
 
-    // 2. Validation des données reçues
+    /* ------------------------------ VALIDATION ------------------------------ */
     if (!userId || !agentUid || !companyId || !points || points <= 0) {
       return NextResponse.json(
-        { error: 'Données invalides ou manquantes.' },
+        { success: false, error: "Données invalides ou incomplètes." },
         { status: 400 }
       );
     }
 
-    // 3. Exécution de la Transaction Atomique
+    /* ------------------------------ TRANSACTION FIRESTORE ------------------------------ */
     const result = await db.runTransaction(async (transaction) => {
-      // Références
-      const companyRef = db.collection('recycling_companies').doc(companyId);
-      const userRef = db.collection('users').doc(userId);
-      const transactionRef = db.collection('transactions').doc(); // Nouvel ID auto
+      const companyRef = db.collection("recycling_companies").doc(companyId);
+      const userRef = db.collection("users").doc(userId);
+      const transactionRef = db.collection("transactions").doc();
 
-      // A. Lecture (Doit se faire avant toute écriture)
       const companyDoc = await transaction.get(companyRef);
       const userDoc = await transaction.get(userRef);
 
       if (!companyDoc.exists) {
-        throw new Error("L'entreprise de recyclage est introuvable.");
+        throw new Error("Entreprise introuvable.");
       }
-      
+
       const currentCompanyPoints = companyDoc.data()?.currentPoints || 0;
 
-      // B. Vérification du Solde
       if (currentCompanyPoints < points) {
-        throw new Error(`Solde insuffisant. L'entreprise a ${currentCompanyPoints} points, mais ${points} sont requis.`);
+        throw new Error(
+          `Solde insuffisant. L'entreprise possède ${currentCompanyPoints} points, mais ${points} sont requis.`
+        );
       }
 
-      // C. Débit Entreprise
+      /* -------- Débit entreprise -------- */
       transaction.update(companyRef, {
         currentPoints: admin.firestore.FieldValue.increment(-points),
       });
 
-      // D. Crédit Utilisateur (Création si inexistant)
+      /* -------- Crédit utilisateur -------- */
       if (userDoc.exists) {
         transaction.update(userRef, {
           points: admin.firestore.FieldValue.increment(points),
         });
       } else {
-        // Si c'est le premier dépôt de l'utilisateur, on crée son document
         transaction.set(userRef, {
-          points: points,
+          points,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          // Ajoutez d'autres champs par défaut si nécessaire (email, etc.)
         });
       }
 
-      // E. Enregistrement de l'Historique
+      /* -------- Historique -------- */
       transaction.set(transactionRef, {
         userId,
         agentUid,
         companyId,
-        points,
         weightKg,
-        type: 'CREDIT',
-        status: 'COMPLETED', // Transaction validée directement
+        points,
+        type: "CREDIT",
+        status: "COMPLETED",
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      return { transactionId: transactionRef.id, points };
+      return {
+        transactionId: transactionRef.id,
+        points,
+      };
     });
 
-    // 4. Réponse Succès
-    return NextResponse.json(
-      { success: true, data: result },
-      { status: 200 }
-    );
-
+    return NextResponse.json({ success: true, data: result }, { status: 200 });
   } catch (error: any) {
-    console.error("Erreur API Transaction:", error);
+    console.error("❌ Erreur API Transaction :", error);
     return NextResponse.json(
-      { error: error.message || 'Erreur serveur interne.' },
+      { success: false, error: error.message || "Erreur serveur interne." },
       { status: 500 }
     );
   }
