@@ -7,7 +7,7 @@ const PAYDUNYA_TOKEN = process.env.PAYDUNYA_TOKEN;
 const PAYDUNYA_BASE_URL = process.env.PAYDUNYA_API_BASE_URL;
 
 // URL vers laquelle PayDunya enverra la confirmation de paiement (à créer plus tard)
-const IPN_URL = 'https://votredomaine.vercel.app/api/paydunya-webhook'; 
+const IPN_URL = 'https://kpaya-agent-web.vercel.app/api/paydunya-webhook'; 
 
 export async function POST(req: NextRequest) {
     
